@@ -7,23 +7,41 @@ detect_os(){ . /etc/os-release || { echo "Unsupported OS"; exit 1; }; case "$ID"
 prompt(){ local q="$1" def="${2:-}" a=""; read -r -p "$q ${def:+[$def]}: " a || true; echo "${a:-$def}"; }
 
 # ==== Dockerインストール ====
-install_docker(){
+install_docker() {
   if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     echo "✅ Docker & Compose already installed."
     return
   fi
-  echo "🚀 Installing Docker..."
+
+  # OS 判定
+  . /etc/os-release || { echo "Unsupported OS"; exit 1; }
+  case "$ID" in
+    ubuntu)  DOCKER_OS="ubuntu"  ;;
+    debian)  DOCKER_OS="debian"  ;;
+    *) echo "Unsupported OS for docker install: $ID"; exit 1 ;;
+  esac
+
+  echo "🚀 Installing Docker for $ID ($VERSION_CODENAME)..."
   apt-get update -y
   apt-get install -y ca-certificates curl gnupg lsb-release
-  install -m0755 -d /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL "https://download.docker.com/linux/${DOCKER_OS}/gpg" \
+    | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
   chmod a+r /etc/apt/keyrings/docker.gpg
-  echo \
-    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-    https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
-    > /etc/apt/sources.list.d/docker.list
-  apt-get update -y && apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-  systemctl enable docker; systemctl start docker
+
+  cat >/etc/apt/sources.list.d/docker.list <<EOF
+deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/${DOCKER_OS} ${VERSION_CODENAME} stable
+EOF
+
+  apt-get update -y
+  apt-get install -y \
+    docker-ce docker-ce-cli containerd.io \
+    docker-buildx-plugin docker-compose-plugin
+
+  systemctl enable docker
+  systemctl start docker
 }
 
 # ==== Firewall設定 ====
