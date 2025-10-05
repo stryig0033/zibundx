@@ -1,147 +1,59 @@
+# 1) インストーラを作成
+cat > deploy-bookstack.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-#========================================
-# BookStack 一発デプロイスクリプト
-#  - Ubuntu 22.04/24.04想定
-#  - Docker + MariaDB + BookStack(+任意でCaddy/HTTPS)
-#  - 対話で .env / docker-compose.yml を生成し、起動まで実施
-#========================================
+require_root(){ [ "$(id -u)" -eq 0 ] || { echo "Please run as root (sudo)."; exit 1; }; }
+detect_os(){ . /etc/os-release || { echo "Unsupported OS"; exit 1; }; case "$ID" in ubuntu|debian) :;; *) echo "Ubuntu/Debian only"; exit 1;; esac; }
+prompt(){ local q="$1" def="${2:-}" a=""; read -r -p "$q ${def:+[$def]}: " a || true; echo "${a:-$def}"; }
 
-require_root() {
-  if [ "$(id -u)" -ne 0 ]; then
-    echo "このスクリプトは root で実行してください（例: sudo $0）"
-    exit 1
-  fi
-}
-
-detect_os() {
-  if [ -r /etc/os-release ]; then
-    . /etc/os-release
-    OS_ID="${ID:-}"
-    OS_VERSION_ID="${VERSION_ID:-}"
-  else
-    echo "/etc/os-release が見つかりません。Ubuntu系を想定しています。"
-    exit 1
-  fi
-  if [[ "$OS_ID" != "ubuntu" && "$OS_ID" != "debian" ]]; then
-    echo "このスクリプトは Ubuntu/Debian 系のみサポートします。検出: $OS_ID $OS_VERSION_ID"
-    exit 1
-  fi
-}
-
-prompt_default() {
-  local prompt="$1"
-  local default="${2:-}"
-  local var=""
-  if [ -n "$default" ]; then
-    read -r -p "$prompt [$default]: " var || true
-    echo "${var:-$default}"
-  else
-    read -r -p "$prompt: " var || true
-    echo "$var"
-  fi
-}
-
-random_string() {
-  # 32文字の英数字
-  openssl rand -hex 24
-}
-
-install_packages() {
-  echo "==> パッケージ更新 & 事前ツール導入"
+install_docker(){
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then echo "Docker & Compose already installed."; return; fi
   apt-get update -y
-  apt-get install -y ca-certificates curl gnupg lsb-release ufw
-}
-
-install_docker() {
-  if command -v docker >/dev/null 2>&1; then
-    echo "==> Docker は既にインストールされています。"
-    return
-  fi
-  echo "==> Docker をインストールします（公式リポジトリ）"
-  install_packages
-
-  install -m 0755 -d /etc/apt/keyrings
+  apt-get install -y ca-certificates curl gnupg lsb-release
+  install -m0755 -d /etc/apt/keyrings
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
   chmod a+r /etc/apt/keyrings/docker.gpg
-
-  ARCH="$(dpkg --print-architecture)"
-  CODENAME="$(. /etc/os-release && echo "$VERSION_CODENAME")"
-  echo \
-"deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${CODENAME} stable" \
-    | tee /etc/apt/sources.list.d/docker.list >/dev/null
-
-  apt-get update -y
-  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-
-  systemctl enable docker
-  systemctl start docker
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+    > /etc/apt/sources.list.d/docker.list
+  apt-get update -y && apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+  systemctl enable docker; systemctl start docker
 }
 
-enable_firewall() {
-  if command -v ufw >/dev/null 2>&1; then
-    if ufw status | grep -qi inactive; then
-      echo "==> UFW（ファイアウォール）を有効化します"
-      ufw allow OpenSSH >/dev/null 2>&1 || true
-      ufw --force enable
-    fi
-  fi
+ensure_fw(){
+  apt-get install -y ufw >/dev/null 2>&1 || true
+  if ufw status 2>/dev/null | grep -qi inactive; then ufw allow OpenSSH >/dev/null 2>&1 || true; ufw --force enable || true; fi
 }
+allow_ports(){ if command -v ufw >/dev/null 2>&1; then
+  if [ "$1" = "yes" ]; then ufw allow 80/tcp >/dev/null 2>&1 || true; ufw allow 443/tcp >/dev/null 2>&1 || true; else ufw allow 80/tcp >/dev/null 2>&1 || true; fi
+fi; }
 
-allow_ports() {
-  local use_caddy="$1"
-  if command -v ufw >/dev/null 2>&1; then
-    if [ "$use_caddy" = "yes" ]; then
-      ufw allow 80/tcp >/dev/null 2>&1 || true
-      ufw allow 443/tcp >/dev/null 2>&1 || true
-    else
-      ufw allow 8080/tcp >/dev/null 2>&1 || true
-    fi
-  fi
-}
+ext_ip(){ curl -fsS --max-time 3 ifconfig.me || hostname -I | awk '{print $1}'; }
+gen_app_key(){ docker pull ghcr.io/linuxserver/bookstack:latest >/dev/null; docker run --rm ghcr.io/linuxserver/bookstack:latest appkey | tail -n1; }
 
-create_project_skeleton() {
-  mkdir -p /opt/bookstack/{db_data,app_data,caddy_data,caddy_config}
-}
+write_env(){
+cat > .env <<EOF
+PUID=0
+PGID=0
+TZ=$TZ_INPUT
 
-write_env_file() {
-  local env_path="$1"
-  local PUID="$2"
-  local PGID="$3"
-  local TZ="$4"
-  local APP_URL="$5"
-  local DB_DATABASE="$6"
-  local DB_USER="$7"
-  local DB_PASS="$8"
-  local DB_ROOT_PASS="$9"
+APP_URL=$APP_URL
+APP_KEY=$APP_KEY
 
-  cat > "$env_path" <<EOF
-#==== BookStack 環境変数 (.env) ====
-PUID=${PUID}
-PGID=${PGID}
-TZ=${TZ}
-
-# BookStack アプリ URL
-APP_URL=${APP_URL}
-
-# DB接続設定
 DB_HOST=db
-DB_DATABASE=${DB_DATABASE}
-DB_USER=${DB_USER}
-DB_PASS=${DB_PASS}
+DB_DATABASE=$DB_NAME
+DB_USER=$DB_USER
+DB_PASS=$DB_PASS
 
-# MariaDB root
-MYSQL_ROOT_PASSWORD=${DB_ROOT_PASS}
-MYSQL_DATABASE=${DB_DATABASE}
-MYSQL_USER=${DB_USER}
-MYSQL_PASSWORD=${DB_PASS}
+MYSQL_ROOT_PASSWORD=$DB_ROOT
+MYSQL_DATABASE=$DB_NAME
+MYSQL_USER=$DB_USER
+MYSQL_PASSWORD=$DB_PASS
 EOF
 }
 
-write_compose_no_tls() {
-  local compose_path="$1"
-  cat > "$compose_path" <<'EOF'
+compose_http(){
+cat > docker-compose.yml <<'EOF'
 services:
   db:
     image: mariadb:10.6
@@ -158,14 +70,14 @@ services:
   bookstack:
     image: ghcr.io/linuxserver/bookstack:latest
     container_name: bookstack_app
-    depends_on:
-      - db
+    depends_on: [db]
     restart: unless-stopped
     environment:
       - PUID=${PUID}
       - PGID=${PGID}
       - TZ=${TZ}
       - APP_URL=${APP_URL}
+      - APP_KEY=${APP_KEY}
       - DB_HOST=db
       - DB_DATABASE=${DB_DATABASE}
       - DB_USER=${DB_USER}
@@ -173,13 +85,12 @@ services:
     volumes:
       - ./app_data:/config
     ports:
-      - "8080:80"
+      - "80:80"
 EOF
 }
 
-write_compose_with_caddy() {
-  local compose_path="$1"
-  cat > "$compose_path" <<'EOF'
+compose_https(){
+cat > docker-compose.yml <<'EOF'
 services:
   db:
     image: mariadb:10.6
@@ -196,138 +107,87 @@ services:
   bookstack:
     image: ghcr.io/linuxserver/bookstack:latest
     container_name: bookstack_app
-    depends_on:
-      - db
+    depends_on: [db]
     restart: unless-stopped
     environment:
       - PUID=${PUID}
       - PGID=${PGID}
       - TZ=${TZ}
       - APP_URL=${APP_URL}
+      - APP_KEY=${APP_KEY}
       - DB_HOST=db
       - DB_DATABASE=${DB_DATABASE}
       - DB_USER=${DB_USER}
       - DB_PASS=${DB_PASS}
     volumes:
       - ./app_data:/config
+    expose:
+      - "80"
 
   caddy:
     image: caddy:2
     container_name: bookstack_caddy
+    depends_on: [bookstack]
     restart: unless-stopped
     ports:
       - "80:80"
       - "443:443"
-    environment:
-      - ACME_AGREE=true
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - ./caddy_data:/data
-      - ./caddy_config:/config
 EOF
 }
 
-write_caddyfile() {
-  local caddyfile_path="$1"
-  local acme_email="$2"
-  local domain="$3"
-
-  cat > "$caddyfile_path" <<EOF
+write_caddyfile(){
+cat > Caddyfile <<EOF
 {
-  email ${acme_email}
+  email $ACME_EMAIL
 }
-
-${domain} {
+$DOMAIN {
   encode gzip
   reverse_proxy bookstack:80
 }
 EOF
 }
 
-post_instructions() {
-  local use_caddy="$1"
-  local app_url="$2"
-
-  echo
-  echo "============================================================="
-  echo "  ✅ BookStack デプロイ完了"
-  echo "-------------------------------------------------------------"
-  echo "URL: ${app_url}"
-  if [ "$use_caddy" = "yes" ]; then
-    echo "※ 初回アクセス時に自動でLet's Encryptにより証明書取得します。"
-  else
-    echo "※ 8080番ポートで稼働中（例： http://<サーバIP>:8080 ）"
-  fi
-  echo
-  echo "[管理ガイド]"
-  echo "  起動   : docker compose up -d"
-  echo "  停止   : docker compose down"
-  echo "  ログ   : docker compose logs -f"
-  echo "  更新   : docker compose pull && docker compose up -d"
-  echo "  バックアップ(DB): docker exec bookstack_db sh -c 'mysqldump -u\"$MYSQL_USER\" -p\"$MYSQL_PASSWORD\" \"$MYSQL_DATABASE\"' > /opt/bookstack/backup_$(date +%Y%m%d).sql"
-  echo
-  echo "[補足]"
-  echo "  - 初回アクセス後、画面の案内に従って管理ユーザーを作成してください。"
-  echo "  - メール送信等が必要な場合は、/opt/bookstack/app_data 内の .env を編集して再起動してください。"
-  echo "============================================================="
+post_note(){
+  echo; echo "==============================================="; echo " ✅ BookStack deployed!"; echo " URL : $APP_URL"
+  [ "$USE_TLS" = "yes" ] && echo " Note: First HTTPS access issues a Let's Encrypt cert automatically."
+  echo "-----------------------------------------------"
+  echo " Manage: cd /opt/bookstack && docker compose logs -f"
+  echo " Update: docker compose pull && docker compose up -d"
+  echo " Stop  : docker compose down"
+  echo " Backup(DB): docker exec bookstack_db sh -lc \"mysqldump -u\\\"$DB_USER\\\" -p\\\"$DB_PASS\\\" \\\"$DB_NAME\\\"\" > /opt/bookstack/backup_\$(date +%Y%m%d).sql"
+  echo "==============================================="
 }
 
-main() {
-  require_root
-  detect_os
-  install_docker
-  enable_firewall
+main(){
+  require_root; detect_os; install_docker; ensure_fw
 
-  echo "==> BookStack セットアップを開始します（所要 3〜10分）"
-  echo
+  DOMAIN="$(prompt 'Domain for HTTPS (empty = HTTP only)')"
+  TZ_INPUT="$(prompt 'Timezone' 'Asia/Tokyo')"
+  DB_NAME="$(prompt 'DB name' 'bookstackapp')"
+  DB_USER="$(prompt 'DB user' 'bookstack')"
+  DB_PASS="$(openssl rand -hex 16)"; DB_ROOT="$(openssl rand -hex 16)"; APP_KEY="$(gen_app_key)"
 
-  #=== 対話入力 ===
-  SERVER_IP=$(hostname -I | awk '{print $1}')
-  DOMAIN="$(prompt_default 'ドメイン名（HTTPSを使う場合は入力。未設定なら空でOK）' '')"
-  USE_CADDY="no"
-  APP_URL=""
-  ACME_EMAIL=""
-  if [ -n "$DOMAIN" ]; then
-    USE_CADDY="yes"
-    ACME_EMAIL="$(prompt_default 'Let\'s Encrypt 通知用メールアドレス' 'admin@'"${DOMAIN#*.}")"
-    APP_URL="https://${DOMAIN}"
-  else
-    APP_URL="http://${SERVER_IP}:8080"
-  fi
+  if [ -n "$DOMAIN" ]; then USE_TLS="yes"; APP_URL="https://$DOMAIN"; ACME_EMAIL="$(prompt "Let's Encrypt email" "admin@${DOMAIN#*.}")"
+  else USE_TLS="no"; APP_URL="http://$(ext_ip)"; fi
 
-  TZ_INPUT="$(prompt_default 'タイムゾーン' 'Asia/Tokyo')"
-  DB_NAME="$(prompt_default 'DB名' 'bookstackapp')"
-  DB_USER="$(prompt_default 'DBユーザー' 'bookstack')"
-  DB_PASS_DEFAULT="$(random_string)"
-  DB_PASS="$(prompt_default 'DBパスワード' "$DB_PASS_DEFAULT")"
-  DB_ROOT_PASS_DEFAULT="$(random_string)"
-  DB_ROOT_PASS="$(prompt_default 'DB root パスワード' "$DB_ROOT_PASS_DEFAULT")"
+  mkdir -p /opt/bookstack && cd /opt/bookstack
+  mkdir -p db_data app_data
 
-  # 実行ユーザーの UID/GID を PUID/PGID に合わせる（rootなら 0/0）
-  PUID="${SUDO_UID:-0}"
-  PGID="${SUDO_GID:-0}"
+  write_env
+  if [ "$USE_TLS" = "yes" ]; then compose_https; write_caddyfile; else compose_http; fi
 
-  #=== 構成生成 ===
-  create_project_skeleton
-  cd /opt/bookstack
-
-  write_env_file "/opt/bookstack/.env" "$PUID" "$PGID" "$TZ_INPUT" "$APP_URL" "$DB_NAME" "$DB_USER" "$DB_PASS" "$DB_ROOT_PASS"
-
-  if [ "$USE_CADDY" = "yes" ]; then
-    write_compose_with_caddy "/opt/bookstack/docker-compose.yml"
-    write_caddyfile "/opt/bookstack/Caddyfile" "$ACME_EMAIL" "$DOMAIN"
-  else
-    write_compose_no_tls "/opt/bookstack/docker-compose.yml"
-  fi
-
-  #=== 起動 ===
-  allow_ports "$USE_CADDY"
-
-  echo "==> コンテナを起動します（初回はイメージ取得のため少し時間がかかります）"
+  allow_ports "$USE_TLS"
   docker compose pull
   docker compose up -d
-
-  post_instructions "$USE_CADDY" "$APP_URL"
+  post_note
 }
+main
+BASH
 
-main "$@"
+# 2) 実行権限付与
+chmod +x deploy-bookstack.sh
+
+# 3) 実行
+sudo ./deploy-bookstack.sh
