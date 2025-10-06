@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 # BookStack one-shot installer for Ubuntu/Debian (HTTP or HTTPS w/ Caddy)
+# - Idempotent: safe to re-run
+# - Auto-fixes Docker apt repo (Ubuntu/Debian)
+# - Cleans stale app_data/www/.env if it's wrong (e.g., database_username)
 set -Eeuo pipefail
-
 trap 'echo "❌ Error on line $LINENO"; exit 1' ERR
-log()  { printf "\n\033[1;34m[INFO]\033[0m %s\n" "$*"; }
-die()  { printf "\033[1;31m[ERR ]\033[0m %s\n" "$*"; exit 1; }
+log() { printf "\n\033[1;34m[INFO]\033[0m %s\n" "$*"; }
+die() { printf "\033[1;31m[ERR ]\033[0m %s\n" "$*"; exit 1; }
 
 require_root(){ [ "$(id -u)" -eq 0 ] || die "Please run as root (sudo)."; }
 detect_os(){ . /etc/os-release || die "Unsupported OS"; case "$ID" in ubuntu|debian) :;; *) die "Ubuntu/Debian only (got: $ID)";; esac; }
-
 usage(){
 cat <<'USAGE'
 Usage: sudo ./setup-bookstack.sh [options]
   --non-interactive
-  --domain=FQDN            (HTTPS via Caddy + Let's Encrypt)
-  --http-only              (force HTTP on :80 using external IP)
+  --domain=FQDN              (HTTPS via Caddy + Let's Encrypt)
+  --http-only                (force HTTP on :80 using external IP)
   --tz=Asia/Tokyo
   --db-name=bookstackapp
   --db-user=bookstack
@@ -23,7 +24,7 @@ Env (when --non-interactive): ZDX_DOMAIN, ZDX_HTTP_ONLY=1, ZDX_TZ, ZDX_DB_NAME, 
 USAGE
 }
 
-# ---------- parse args ----------
+# ---------------- args ----------------
 NONINT=0; WANT_DOMAIN=""; HTTP_ONLY=0; TZ_INPUT=""; DB_NAME=""; DB_USER=""; ACME_EMAIL=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -47,7 +48,7 @@ if [ "$NONINT" = "1" ]; then
   : "${ACME_EMAIL:=${ZDX_EMAIL:-}}"
 fi
 
-# ---------- docker repo & install ----------
+# ---------------- docker install ----------------
 fix_docker_repo() {
   . /etc/os-release || die "Unsupported OS"
   case "$ID" in ubuntu) DOCKER_OS="ubuntu" ;; debian) DOCKER_OS="debian" ;; *) die "Unsupported: $ID" ;; esac
@@ -73,25 +74,25 @@ install_docker(){
   systemctl enable --now docker
 }
 
-# ---------- firewall ----------
+# ---------------- firewall (UFW) ----------------
 ensure_fw(){
   apt-get install -y ufw >/dev/null 2>&1 || true
   if ufw status 2>/dev/null | grep -qi inactive; then ufw allow OpenSSH >/dev/null 2>&1 || true; ufw --force enable || true; fi
 }
 allow_ports(){ if command -v ufw >/dev/null 2>&1; then ufw allow 80/tcp >/dev/null 2>&1 || true; [ "${1:-no}" = "yes" ] && ufw allow 443/tcp >/dev/null 2>&1 || true; fi; }
 
-# ---------- utils ----------
+# ---------------- utils ----------------
 ext_ip(){ curl -fsS --max-time 3 ifconfig.me || hostname -I | awk '{print $1}'; }
-gen_app_key(){ docker pull ghcr.io/linuxserver/bookstack:latest >/dev/null; docker run --rm --entrypoint /bin/bash ghcr.io/linuxserver/bookstack:latest appkey | tail -n1; }
+# 正式な appkey 呼び出し（LSIOイメージのエントリポイントに含まれてる）
+gen_app_key(){ docker pull ghcr.io/linuxserver/bookstack:latest >/dev/null; docker run --rm ghcr.io/linuxserver/bookstack:latest appkey | tail -n1; }
 pick_puid_pgID(){
-  # 最初の一般ユーザー(UID>=1000)を採用。見つからなければ 1000:1000。
   local uid gid
   uid=$(awk -F: '$3>=1000 && $3<60000 {print $3; exit}' /etc/passwd || true)
   gid=$(awk -F: '$3>=1000 && $3<60000 {print $4; exit}' /etc/passwd || true)
   echo "${uid:-1000}:${gid:-1000}"
 }
 
-# ---------- writers ----------
+# ---------------- writers ----------------
 write_env(){
   local puid="${1%:*}" pgid="${1#*:}"
 cat > .env <<EOF
@@ -238,7 +239,23 @@ ${DOMAIN} {
 EOF
 }
 
-# ---------- main ----------
+# ---------------- app .env cleaner ----------------
+clean_stale_app_env(){
+  # 既存の app_data/www/.env が「database_username」を含む or APP_KEY/DB_* が欠落していれば削除して再生成させる
+  local app_env="app_data/www/.env"
+  if [ -f "$app_env" ]; then
+    if grep -q 'database_username' "$app_env" \
+       || ! grep -q '^APP_KEY=' "$app_env" \
+       || ! grep -q '^DB_DATABASE=' "$app_env" \
+       || ! grep -q '^DB_USER=' "$app_env"; then
+      log "Found stale app .env -> removing to regenerate"
+      rm -f "$app_env"
+      rm -f app_data/www/bootstrap/cache/*.php 2>/dev/null || true
+    fi
+  fi
+}
+
+# ---------------- main ----------------
 main(){
   require_root; detect_os
   log "Detected OS: ID=${ID} CODENAME=${VERSION_CODENAME}"
@@ -282,12 +299,21 @@ main(){
     write_env "$PUID_PGID"; compose_http; allow_ports no
   fi
 
-  # app ディレクトリの所有権を PUID:PGID に
+  # app 側の古い .env を掃除（必要時のみ）
+  clean_stale_app_env
+
+  # app ディレクトリの所有権を PUID:PGID に（php-fpm が root を拒否するため）
   chown -R "${PUID_PGID%:*}:${PUID_PGID#*:}" app_data || true
 
   log "Pulling images & starting containers..."
   docker compose pull
   docker compose up -d
+
+  # 簡易ヘルスチェック（失敗しても続行）
+  sleep 3
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS -I http://127.0.0.1 | head -n1 || true
+  fi
 
   log "Done."
   echo "==============================================="
