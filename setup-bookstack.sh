@@ -108,13 +108,17 @@ TZ=${TZ_INPUT}
 APP_URL=${APP_URL}
 APP_KEY=${APP_KEY}
 
-# --- DB connection from app ---
+# --- DB connection for app (LSIO env -> app .envに反映) ---
 DB_HOST=db
 DB_DATABASE=${DB_NAME}
 DB_USER=${DB_USER}
 DB_PASS=${DB_PASS}
 
-# --- DB bootstrap for mariadb service ---
+# ※ 一部テンプレートや将来の参照に備え、アプリ側キー名も同値で定義しておく
+DB_USERNAME=${DB_USER}
+DB_PASSWORD=${DB_PASS}
+
+# --- DB bootstrap for MariaDB service ---
 MYSQL_ROOT_PASSWORD=${DB_ROOT}
 MYSQL_DATABASE=${DB_NAME}
 MYSQL_USER=${DB_USER}
@@ -128,50 +132,6 @@ MYSQL_PASSWORD=${DB_PASS}
 # MAIL_USERNAME=
 # MAIL_PASSWORD=
 # MAIL_FROM=BookStack <noreply@example.com>
-EOF
-}
-
-compose_http(){
-cat > docker-compose.yml <<'EOF'
-services:
-  db:
-    image: mariadb:10.6
-    container_name: bookstack_db
-    restart: unless-stopped
-    environment:
-      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
-      - MYSQL_DATABASE=${MYSQL_DATABASE}
-      - MYSQL_USER=${MYSQL_USER}
-      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
-      interval: 5s
-      timeout: 3s
-      retries: 30
-    volumes:
-      - ./db_data:/var/lib/mysql
-
-  bookstack:
-    image: ghcr.io/linuxserver/bookstack:latest
-    container_name: bookstack_app
-    depends_on:
-      db:
-        condition: service_healthy
-    restart: unless-stopped
-    environment:
-      - PUID=${PUID}
-      - PGID=${PGID}
-      - TZ=${TZ}
-      - APP_URL=${APP_URL}
-      - APP_KEY=${APP_KEY}
-      - DB_HOST=db
-      - DB_DATABASE=${DB_DATABASE}
-      - DB_USER=${DB_USER}
-      - DB_PASS=${DB_PASS}
-    volumes:
-      - ./app_data:/config
-    ports:
-      - "80:80"
 EOF
 }
 
