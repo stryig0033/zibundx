@@ -105,7 +105,10 @@ allow_ports(){
 
 # ---------- utils ----------
 ext_ip(){ curl -fsS --max-time 3 ifconfig.me || hostname -I | awk '{print $1}'; }
-gen_app_key(){ docker pull ghcr.io/linuxserver/bookstack:latest >/dev/null; docker run --rm ghcr.io/linuxserver/bookstack:latest appkey | tail -n1; }
+gen_app_key(){
+  docker pull ghcr.io/linuxserver/bookstack:latest >/dev/null
+  docker run --rm --entrypoint /bin/bash ghcr.io/linuxserver/bookstack:latest appkey | tail -n1
+}
 
 # ---------- config writers ----------
 write_env(){
