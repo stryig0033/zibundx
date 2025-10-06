@@ -84,7 +84,10 @@ allow_ports(){ if command -v ufw >/dev/null 2>&1; then ufw allow 80/tcp >/dev/nu
 # ---------------- utils ----------------
 ext_ip(){ curl -fsS --max-time 3 ifconfig.me || hostname -I | awk '{print $1}'; }
 # 正式な appkey 呼び出し（LSIOイメージのエントリポイントに含まれてる）
-gen_app_key(){ docker pull ghcr.io/linuxserver/bookstack:latest >/dev/null; docker run --rm ghcr.io/linuxserver/bookstack:latest appkey | tail -n1; }
+gen_app_key(){
+  # Laravel互換の 32バイト鍵（base64:プレフィクス付き）をローカル生成
+  echo "base64:$(openssl rand -base64 32 | tr -d '\n')"
+}
 pick_puid_pgID(){
   local uid gid
   uid=$(awk -F: '$3>=1000 && $3<60000 {print $3; exit}' /etc/passwd || true)
