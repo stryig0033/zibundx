@@ -6,24 +6,14 @@ require_root(){ [ "$(id -u)" -eq 0 ] || { echo "Please run as root (sudo)."; exi
 detect_os(){ . /etc/os-release || { echo "Unsupported OS"; exit 1; }; case "$ID" in ubuntu|debian) :;; *) echo "Ubuntu/Debian only"; exit 1;; esac; }
 prompt(){ local q="$1" def="${2:-}" a=""; read -r -p "$q ${def:+[$def]}: " a || true; echo "${a:-$def}"; }
 
-# ==== Dockerインストール ====
-install_docker() {
-  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-    echo "✅ Docker & Compose already installed."
-    return
-  fi
-
-  # OS 判定
+# ==== Docker APT repo を OS に合わせて常に正しく作り直す ====
+fix_docker_repo() {
   . /etc/os-release || { echo "Unsupported OS"; exit 1; }
   case "$ID" in
     ubuntu)  DOCKER_OS="ubuntu"  ;;
     debian)  DOCKER_OS="debian"  ;;
-    *) echo "Unsupported OS for docker install: $ID"; exit 1 ;;
+    *) echo "Unsupported OS for docker repo: $ID"; exit 1 ;;
   esac
-
-  echo "🚀 Installing Docker for $ID ($VERSION_CODENAME)..."
-  apt-get update -y
-  apt-get install -y ca-certificates curl gnupg lsb-release
 
   install -m 0755 -d /etc/apt/keyrings
   curl -fsSL "https://download.docker.com/linux/${DOCKER_OS}/gpg" \
@@ -34,6 +24,24 @@ install_docker() {
 deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
 https://download.docker.com/linux/${DOCKER_OS} ${VERSION_CODENAME} stable
 EOF
+}
+
+# ==== Dockerインストール（Ubuntu/Debian 両対応、誤設定も強制修復） ====
+install_docker() {
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    echo "✅ Docker & Compose already installed."
+    return
+  fi
+
+  . /etc/os-release || { echo "Unsupported OS"; exit 1; }
+  case "$ID" in ubuntu|debian) :;; *) echo "Unsupported OS: $ID"; exit 1;; esac
+
+  echo "🚀 Installing Docker for $ID ($VERSION_CODENAME)..."
+  apt-get update -y
+  apt-get install -y ca-certificates curl gnupg lsb-release
+
+  # ← ここで毎回 正しい docker.list に再生成（古い ubuntu/bookworm などを上書き）
+  fix_docker_repo
 
   apt-get update -y
   apt-get install -y \
