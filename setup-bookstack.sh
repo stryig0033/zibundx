@@ -1,3 +1,4 @@
+cat > setup-bookstack.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -37,10 +38,14 @@ install_docker() {
   case "$ID" in ubuntu|debian) :;; *) echo "Unsupported OS: $ID"; exit 1;; esac
 
   echo "🚀 Installing Docker for $ID ($VERSION_CODENAME)..."
+
+  # 既存の壊れた docker.list（例: ubuntu/bookworm）を先に除去してから update
+  rm -f /etc/apt/sources.list.d/docker.list || true
+
   apt-get update -y
   apt-get install -y ca-certificates curl gnupg lsb-release
 
-  # ← ここで毎回 正しい docker.list に再生成（古い ubuntu/bookworm などを上書き）
+  # 正しい docker.list を再生成
   fix_docker_repo
 
   apt-get update -y
@@ -209,7 +214,12 @@ post_note(){
 
 # ==== メイン処理 ====
 main(){
-  require_root; detect_os; install_docker; ensure_fw
+  require_root; detect_os
+  . /etc/os-release
+  echo "Detected OS: ID=$ID CODENAME=$VERSION_CODENAME"
+  [ -f /etc/apt/sources.list.d/docker.list ] && { echo "--- docker.list (before) ---"; cat /etc/apt/sources.list.d/docker.list; echo "----------------------------"; } || true
+
+  install_docker; ensure_fw
 
   DOMAIN="$(prompt 'Domain for HTTPS (empty = HTTP only)')"
   TZ_INPUT="$(prompt 'Timezone' 'Asia/Tokyo')"
@@ -241,3 +251,7 @@ main(){
 }
 
 main
+BASH
+
+chmod +x setup-bookstack.sh
+sudo bash -n setup-bookstack.sh && sudo ./setup-bookstack.sh
